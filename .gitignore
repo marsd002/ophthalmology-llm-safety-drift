@@ -60,3 +60,8 @@ wheels/
 *.key
 *api_key*
 *api-key*
+
+# --- Google Cloud service account credentials (NEVER commit) ---
+gcp_service_account.json
+*service_account*.json
+*service-account*.json
