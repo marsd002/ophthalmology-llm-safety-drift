@@ -73,6 +73,15 @@ def is_openai_reasoning_model(model_id: str) -> bool:
     return any(model_id.startswith(p) for p in prefixes)
 
 
+def is_gemini_thinking_model(model_id: str) -> bool:
+    """Gemini 2.5 Pro is a 'thinking' model: it consumes output tokens on
+    internal reasoning before producing the visible answer, and at the
+    protocol default budget of 1024 tokens it frequently returns empty text.
+    Larger budget is required for substantive responses.
+    """
+    return "2.5-pro" in model_id
+
+
 def effective_temperature(family: str, model_id: str) -> float:
     """Return the temperature actually used for this model.
 
@@ -88,11 +97,14 @@ def effective_temperature(family: str, model_id: str) -> float:
 def effective_max_tokens(family: str, model_id: str) -> int:
     """Return the token budget actually used for this model.
 
-    Most models use MAX_TOKENS (1024). OpenAI reasoning models need a much
-    larger budget because they consume tokens for internal reasoning before
-    producing the visible answer.
+    Most models use MAX_TOKENS (1024). Reasoning / thinking models (OpenAI
+    gpt-5 and o-series, Google gemini-2.5-pro) need a much larger budget
+    because they consume tokens for internal reasoning before producing the
+    visible answer.
     """
     if family == "openai" and is_openai_reasoning_model(model_id):
+        return MAX_COMPLETION_TOKENS_REASONING
+    if family == "google" and is_gemini_thinking_model(model_id):
         return MAX_COMPLETION_TOKENS_REASONING
     return MAX_TOKENS
 
@@ -155,13 +167,18 @@ def call_google(model_id, system_prompt, user_prompt):
     from google.genai import types
     client = genai.Client(api_key=os.environ["GOOGLE_API_KEY"])
     t0 = time.time()
+    # Gemini 2.5 Pro is a thinking model: needs MAX_COMPLETION_TOKENS_REASONING
+    # so the visible answer has room after internal reasoning consumption.
+    max_out = (MAX_COMPLETION_TOKENS_REASONING
+               if is_gemini_thinking_model(model_id)
+               else MAX_TOKENS)
     r = client.models.generate_content(
         model=model_id,
         contents=user_prompt,
         config=types.GenerateContentConfig(
             system_instruction=system_prompt,
             temperature=TEMPERATURE,
-            max_output_tokens=MAX_TOKENS,
+            max_output_tokens=max_out,
         ),
     )
     return {
