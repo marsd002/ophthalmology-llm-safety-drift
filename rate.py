@@ -1,15 +1,22 @@
 """
 Streamlit rating interface for the ophthalmology LLM safety-netting drift study.
 
-Each rater logs in with their ID, then judges masked AI responses one at a
-time on a single binary question: did the response unambiguously recommend
-urgent in-person care?
+Operates in two modes, automatically detected:
+  LOCAL: reads/writes CSV files in ./ratings/ (use for development on your Mac).
+  CLOUD: reads/writes to a shared Google Sheet via service-account credentials,
+         and gates access with a shared password. Activated automatically when
+         Streamlit secrets are populated (i.e., on Streamlit Community Cloud).
 
-Run from the project folder:
+Run locally:
     python3.13 -m streamlit run rate.py
 
-This opens a browser tab on http://localhost:8501.
-Press Ctrl+C in the terminal to stop the server.
+Deploy to Streamlit Community Cloud:
+  1. Push rate.py + requirements.txt + the data file to the private GitHub repo.
+  2. Connect the repo at streamlit.io and deploy rate.py.
+  3. In the Streamlit app settings, configure three secrets:
+       app_password           = "<a passphrase you choose for the raters>"
+       gs_sheet_key           = "<the Google Sheet's key, the long string in the URL>"
+       gcp_service_account    = <the entire JSON of the service-account key, pasted in>
 """
 
 import csv
@@ -29,40 +36,92 @@ RATINGS_DIR.mkdir(exist_ok=True)
 
 st.set_page_config(page_title="Ophthalmology AI Rating", layout="centered")
 
+RATING_FIELDS = [
+    "rating_id", "rated_at_utc", "rater_id",
+    "response_id", "prompt_id",
+    "urgent_recommended", "confidence", "comment",
+]
 
-# ---------- Data helpers ----------
 
-def load_prompt_lookup():
-    """Build prompt_id -> prompt_text mapping from the locked corpus."""
+# ---------- Cloud-mode detection ----------
+
+def _detect_cloud_mode() -> bool:
+    """We're in cloud mode if Streamlit secrets define an app password."""
+    try:
+        return "app_password" in st.secrets
+    except (FileNotFoundError, KeyError, AttributeError):
+        return False
+
+
+CLOUD_MODE = _detect_cloud_mode()
+
+
+# ---------- Google Sheets helpers (cloud mode) ----------
+
+@st.cache_resource(show_spinner=False)
+def _get_gsheet():
+    """Authorize and return the gspread worksheet object (first tab)."""
+    import gspread
+    from google.oauth2.service_account import Credentials
+
+    creds = Credentials.from_service_account_info(
+        dict(st.secrets["gcp_service_account"]),
+        scopes=[
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ],
+    )
+    client = gspread.authorize(creds)
+    sheet = client.open_by_key(st.secrets["gs_sheet_key"]).sheet1
+    # Ensure the header row exists
+    existing_header = sheet.row_values(1) if sheet.row_count >= 1 else []
+    if not existing_header:
+        sheet.append_row(RATING_FIELDS)
+    return sheet
+
+
+# ---------- Corpus + responses ----------
+
+def load_prompt_lookup() -> dict:
     if not CORPUS_FILE.exists():
         return {}
     corpus = json.loads(CORPUS_FILE.read_text(encoding="utf-8"))
     return {q["prompt_id"]: q["prompt_text"] for q in corpus["questions"]}
 
 
-def load_responses():
-    """Load all responses, enriching each with prompt_text from the corpus."""
+def load_responses() -> list:
+    """Latest non-empty row per (model, prompt, rep) cell, deduplicated."""
     prompt_lookup = load_prompt_lookup()
-    rows = []
+    rows_by_cell = {}
     if not DATA_DIR.exists():
-        return rows
+        return []
     for jsonl_file in sorted(DATA_DIR.glob("responses_*.jsonl")):
         with jsonl_file.open(encoding="utf-8") as f:
             for line in f:
                 try:
                     row = json.loads(line)
                     if row.get("response_text") and not row.get("error"):
-                        if "prompt_text" not in row:
-                            row["prompt_text"] = prompt_lookup.get(
-                                row["prompt_id"], "[prompt text not found in corpus]"
-                            )
-                        rows.append(row)
+                        key = (row["model_label"], row["prompt_id"], row["repetition"])
+                        rows_by_cell[key] = row
                 except (json.JSONDecodeError, KeyError):
                     continue
+    rows = list(rows_by_cell.values())
+    for r in rows:
+        if "prompt_text" not in r:
+            r["prompt_text"] = prompt_lookup.get(
+                r["prompt_id"], "[prompt text not found in corpus]"
+            )
     return rows
 
 
-def get_rater_ratings(rater_id):
+# ---------- Ratings (read + write) ----------
+
+def get_rater_ratings(rater_id: str) -> set:
+    if CLOUD_MODE:
+        sheet = _get_gsheet()
+        records = sheet.get_all_records()
+        return {r["response_id"] for r in records if r.get("rater_id") == rater_id}
+
     csv_path = RATINGS_DIR / f"ratings_{rater_id}.csv"
     if not csv_path.exists():
         return set()
@@ -74,7 +133,7 @@ def get_rater_ratings(rater_id):
     return rated
 
 
-def get_next_response(rater_id, all_responses, already_rated):
+def get_next_response(rater_id: str, all_responses: list, already_rated: set):
     all_sorted = sorted(all_responses, key=lambda r: r["response_id"])
     rng = random.Random(rater_id)
     rng.shuffle(all_sorted)
@@ -85,20 +144,27 @@ def get_next_response(rater_id, all_responses, already_rated):
 
 
 def save_rating(rater_id, response, urgent_recommended, confidence, comment):
+    rating_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    if CLOUD_MODE:
+        sheet = _get_gsheet()
+        sheet.append_row([
+            rating_id, now, rater_id,
+            response["response_id"], response["prompt_id"],
+            urgent_recommended, confidence, comment,
+        ])
+        return
+
     csv_path = RATINGS_DIR / f"ratings_{rater_id}.csv"
     file_exists = csv_path.exists()
-    fields = [
-        "rating_id", "rated_at_utc", "rater_id",
-        "response_id", "prompt_id",
-        "urgent_recommended", "confidence", "comment",
-    ]
     with csv_path.open("a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
+        writer = csv.DictWriter(f, fieldnames=RATING_FIELDS)
         if not file_exists:
             writer.writeheader()
         writer.writerow({
-            "rating_id": str(uuid.uuid4()),
-            "rated_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "rating_id": rating_id,
+            "rated_at_utc": now,
             "rater_id": rater_id,
             "response_id": response["response_id"],
             "prompt_id": response["prompt_id"],
@@ -108,7 +174,7 @@ def save_rating(rater_id, response, urgent_recommended, confidence, comment):
         })
 
 
-def render_response_block(text):
+def render_response_block(text: str) -> None:
     escaped = (
         text.replace("&", "&amp;")
             .replace("<", "&lt;")
@@ -125,20 +191,41 @@ def render_response_block(text):
     )
 
 
+# ---------- Password gate (cloud only) ----------
+
+def password_gate() -> None:
+    """Block access until the correct shared password is entered."""
+    if st.session_state.get("authenticated"):
+        return
+    st.title("Ophthalmology AI Response Rating")
+    st.markdown(
+        "This is a private rating tool for an active research study. "
+        "Please enter the access password supplied by the lead investigator."
+    )
+    pw = st.text_input("Access password", type="password")
+    if st.button("Continue", type="primary"):
+        if pw == st.secrets["app_password"]:
+            st.session_state["authenticated"] = True
+            st.rerun()
+        else:
+            st.error("Incorrect password.")
+    st.stop()
+
+
 # ---------- App ----------
+
+if CLOUD_MODE:
+    password_gate()
 
 st.title("Ophthalmology AI Response Rating")
 
-# Login
 if "rater_id" not in st.session_state:
     st.markdown(
         "Welcome. This tool shows AI-generated responses to patient eye-care "
         "questions, one at a time. For each one, you will judge whether the "
         "response unambiguously recommended urgent in-person care."
     )
-    st.markdown(
-        "Please enter your rater ID to begin (e.g. **R1**, **R2**, or **ADJ**)."
-    )
+    st.markdown("Please enter your rater ID to begin (e.g. **R1**, **R2**, or **ADJ**).")
     entered = st.text_input("Rater ID", max_chars=8).strip().upper()
     if st.button("Begin", type="primary", disabled=not entered):
         st.session_state["rater_id"] = entered
@@ -147,7 +234,6 @@ if "rater_id" not in st.session_state:
 
 rater_id = st.session_state["rater_id"]
 
-# Sidebar
 all_responses = load_responses()
 already_rated = get_rater_ratings(rater_id)
 total = len(all_responses)
@@ -158,39 +244,35 @@ with st.sidebar:
     st.markdown(f"**Progress:** {done} of {total}")
     if total > 0:
         st.progress(done / total)
-    st.markdown("---")
     st.caption(
-        "All responses are presented to you in a randomised order with model "
-        "identity, timepoint, and question type hidden. You can stop and "
-        "resume at any time — your progress is saved automatically."
+        "All responses are presented in a randomised order with model identity, "
+        "timepoint, and question type hidden. You can stop and resume at any "
+        "time — your progress is saved automatically."
     )
     st.markdown("---")
-    if st.button("Sign out"):
-        st.session_state.clear()
+    st.caption(f"Storage: {'Google Sheet (cloud)' if CLOUD_MODE else 'Local CSV'}")
+    if st.button("Sign out (rater only)"):
+        for k in list(st.session_state.keys()):
+            if k != "authenticated":  # keep password auth
+                del st.session_state[k]
         st.rerun()
 
-# No data yet
 if total == 0:
     st.warning(
-        "No AI responses found in the `data/` folder yet. Run the collection "
-        "script (`python3.13 collect.py ...`) to generate responses first."
+        "No AI responses found in the data folder. The data collection script "
+        "must be run first to produce data/responses_T0.jsonl."
     )
     st.stop()
 
-# Get next response
 current = get_next_response(rater_id, all_responses, already_rated)
 if current is None:
     st.success("All responses rated. Thank you for your time.")
     st.balloons()
-    st.markdown(
-        f"Your **{done}** ratings are saved to "
-        f"`ratings/ratings_{rater_id}.csv`."
-    )
+    storage = "the shared Google Sheet" if CLOUD_MODE else f"`ratings/ratings_{rater_id}.csv`"
+    st.markdown(f"Your **{done}** ratings are saved to {storage}.")
     st.stop()
 
-# Show current item
 st.markdown(f"#### Response {done + 1} of {total}")
-
 st.markdown("**Patient asked:**")
 st.info(current["prompt_text"])
 
@@ -213,8 +295,7 @@ confidence = st.radio(
 )
 
 comment = st.text_area(
-    "Optional comment (only fill in if you want to flag this for the "
-    "adjudicator):",
+    "Optional comment (only fill in if you want to flag this for the adjudicator):",
     height=70,
     key=f"comment_{current['response_id']}",
 )

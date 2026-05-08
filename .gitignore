@@ -1,13 +1,22 @@
-# --- Critical: secrets and data must NEVER be committed ---
+# --- Critical: secrets and rater data must NEVER be committed ---
 .env
 .env.*
 *.env
-data/
 ratings/
 archive/
 logs/
 *.LOCAL_BACKUP.*
 *_backup.*
+
+# --- Data: response files generally ignored, BUT canonical timepoint
+# datasets are kept in the (private) repo so the cloud rating app can
+# read them. Pilot/SMOKE/VERIFY runs stay archived locally.
+# Note: 'data/*' (with asterisk) lets Git look inside the directory so
+# the exception lines below can take effect; bare 'data/' would short-circuit.
+data/*
+!data/responses_T0.jsonl
+!data/responses_T+3.jsonl
+!data/responses_T+6.jsonl
 
 # --- macOS noise ---
 .DS_Store
