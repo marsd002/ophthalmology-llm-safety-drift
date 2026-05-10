@@ -120,7 +120,12 @@ def get_rater_ratings(rater_id: str) -> set:
     if CLOUD_MODE:
         sheet = _get_gsheet()
         records = sheet.get_all_records()
-        return {r["response_id"] for r in records if r.get("rater_id") == rater_id}
+        rated = {r["response_id"] for r in records if r.get("rater_id") == rater_id}
+        # Merge with this session's locally tracked ratings to bridge the
+        # Google Sheets API consistency lag (a row written 100 ms ago
+        # may not yet show up in the next read).
+        rated |= st.session_state.get("session_rated", set())
+        return rated
 
     csv_path = RATINGS_DIR / f"ratings_{rater_id}.csv"
     if not csv_path.exists():
@@ -154,6 +159,11 @@ def save_rating(rater_id, response, urgent_recommended, confidence, comment):
             response["response_id"], response["prompt_id"],
             urgent_recommended, confidence, comment,
         ])
+        # Track locally so the next render sees this rating even if the
+        # Google Sheets read lags briefly behind the write.
+        if "session_rated" not in st.session_state:
+            st.session_state["session_rated"] = set()
+        st.session_state["session_rated"].add(response["response_id"])
         return
 
     csv_path = RATINGS_DIR / f"ratings_{rater_id}.csv"
